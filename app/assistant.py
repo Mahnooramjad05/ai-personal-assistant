@@ -29,6 +29,12 @@ class Assistant:
     def __init__(self, llm: LLMClient | None = None, db_path: str | None = None) -> None:
         self.llm = llm or get_llm_client()
         self.db_path = db_path or settings.database_path
+        # The tool layer (app/tools/*) and the orchestrator dispatch table
+        # call app.store without an explicit db_path, so they always read
+        # settings.database_path. Keep that in sync with whatever path this
+        # Assistant instance was actually constructed with, so passing a
+        # custom db_path here consistently applies everywhere downstream.
+        settings.database_path = self.db_path
         store.init_db(self.db_path)
 
     def chat(self, session_id: str, message: str) -> ChatResult:
