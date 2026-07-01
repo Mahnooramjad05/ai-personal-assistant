@@ -28,6 +28,12 @@ def test_multi_step_request_triggers_task_then_reminder(monkeypatch, db_path, se
     reminders = assistant.get_reminders(session_id)
     assert any("dentist" in t["title"].lower() for t in tasks)
     assert len(reminders) == 1
+    # Regression check: the reminder's message must be the actual subject
+    # ("call the dentist"), not a mangled fragment of the time phrase (a
+    # prior bug over-matched "to" inside "tomorrow" when stripping the
+    # "remind me to" prefix, producing "morrow at 9am").
+    assert "dentist" in reminders[0]["message"].lower()
+    assert "morrow" not in reminders[0]["message"].lower()
 
 
 def test_single_step_request_triggers_one_tool_call(monkeypatch, db_path, session_id):

@@ -105,6 +105,15 @@ class MockLLMClient(LLMClient):
         for clause in clauses:
             call = self._classify_clause(clause, lowered_full=lowered)
             if call:
+                # If this reminder has no message of its own (e.g. "remind
+                # me tomorrow at 9am" following "add a task to call the
+                # dentist"), reuse the subject of the immediately preceding
+                # create_task call so the reminder is about the same thing.
+                if call["tool"] == "create_reminder" and not call["args"].get("message"):
+                    if calls and calls[-1]["tool"] == "create_task":
+                        call["args"]["message"] = calls[-1]["args"]["title"]
+                    else:
+                        call["args"]["message"] = clause.strip() or "Reminder"
                 calls.append(call)
 
         if not calls:
@@ -127,12 +136,25 @@ class MockLLMClient(LLMClient):
         # Reminder creation: "remind me to X at/on <time>"
         if "remind me" in cl or cl.startswith("reminder"):
             time_hint = self._extract_time_hint(c)
+            # \b after "to" prevents this from also eating the "to" inside
+            # "tomorrow" (e.g. "remind me tomorrow at 9am").
             message = re.sub(
-                r"remind me( to)?", "", c, flags=re.I
+                r"remind me(\s+to\b)?", "", c, flags=re.I
             ).strip(" ,.:;-")
+            # Strip the time hint back out of the message when the user
+            # gave no explicit reminder text (e.g. "remind me tomorrow at
+            # 9am" with no task mentioned) so we don't store the due-date
+            # phrase as the reminder's message.
+            if time_hint and message.strip().lower() == time_hint.strip().lower():
+                message = ""
+            # Leave "message" empty (rather than falling back to the raw
+            # clause `c`, which would include the time phrase) when no
+            # reminder text was given - _select_tools fills it in from the
+            # preceding clause's subject, or falls back to `c` as a last
+            # resort if there is no preceding task to borrow from.
             return {
                 "tool": "create_reminder",
-                "args": {"message": message or c, "when_text": time_hint or "today"},
+                "args": {"message": message, "when_text": time_hint or "today"},
             }
 
         # Task listing
