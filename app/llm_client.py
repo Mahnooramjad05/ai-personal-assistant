@@ -1,17 +1,28 @@
 """Pluggable LLM client.
 
-Supports three backends, selected via the LLM_PROVIDER env var:
+Supports four backends, selected via the LLM_PROVIDER env var:
   - "anthropic": uses the official `anthropic` SDK (claude-opus-4-8 by default)
   - "openai": uses the official `openai` SDK
+  - "hermes": a NousResearch Hermes model served behind any OpenAI-compatible
+    chat-completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, ...);
+    reuses the `openai` SDK pointed at a custom `base_url` rather than
+    pulling in a new dependency
   - "mock": a deterministic, offline, no-network implementation used for
     local development and for the test suite (default, so the project runs
     out of the box without any API key).
 
-All three implement the same minimal interface: `complete(messages, system)`.
+All four implement the same minimal interface: `complete(messages, system)`.
 `messages` is a list of {"role": "user"|"assistant", "content": str} dicts
-(no tool-calling protocol here - tool selection is handled one level up, in
-app/orchestrator.py, via a small JSON-based function-calling convention that
-works identically across all three backends).
+and the return value is always a plain `str`. Tool selection is handled one
+level up, in app/orchestrator.py, via a small JSON-based function-calling
+convention (`{"tool_calls": [{"tool": "...", "args": {...}}, ...]}`) that
+works identically across all backends: the orchestrator asks for that JSON
+shape in the system prompt and parses whatever text `complete()` returns.
+The Hermes provider additionally drives the real OpenAI-compatible `tools`
+parameter under the hood (since many Hermes deployments support native
+function calling, or emit `<tool_call>` tags), but normalizes the result
+back into that same JSON-text convention before returning it, so the
+orchestrator's control flow needs no changes at all.
 """
 from __future__ import annotations
 
@@ -364,6 +375,193 @@ class OpenAILLMClient(LLMClient):
         return (response.choices[0].message.content or "").strip()
 
 
+class HermesLLMClient(LLMClient):
+    """NousResearch Hermes backend via any OpenAI-compatible endpoint.
+
+    Hermes models are typically served behind an OpenAI-compatible
+    chat-completions API (Ollama, vLLM, LM Studio, OpenRouter, ...), so this
+    reuses the official `openai` SDK pointed at a custom `base_url` instead
+    of adding a new HTTP dependency for a fourth provider.
+    """
+
+    # Matches `<tool_call>{"name": ..., "arguments": ...}</tool_call>`-style
+    # tags that some Hermes chat templates emit inline in message content
+    # when the serving stack doesn't support structured tool calling.
+    _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+    # Mirrors the tool catalogue described to the LLM in
+    # orchestrator.TOOL_SELECTION_SYSTEM, expressed as OpenAI-style function
+    # schemas so servers with native function-calling support can use them.
+    _TOOLS: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "create_task",
+                "description": "Create a new task for the user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_tasks",
+                "description": "List the user's tasks.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "complete_task",
+                "description": "Mark a task as complete by (fuzzy) title.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_task",
+                "description": "Delete a task by (fuzzy) title.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_reminder",
+                "description": "Create a reminder from a natural-language due time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "when_text": {"type": "string"},
+                    },
+                    "required": ["message", "when_text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_reminders",
+                "description": "List reminders due in a given period.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"when": {"type": "string"}},
+                    "required": ["when"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_knowledge",
+                "description": "Search the local knowledge base.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        },
+    ]
+
+    def __init__(self) -> None:
+        from openai import OpenAI  # imported lazily so it's optional at runtime
+
+        if not settings.hermes_base_url:
+            raise RuntimeError("HERMES_BASE_URL is not set but LLM_PROVIDER=hermes")
+        self._client = OpenAI(
+            base_url=settings.hermes_base_url,
+            # Many local servers (e.g. Ollama) don't check the API key at
+            # all, but the openai SDK requires a non-empty string.
+            api_key=settings.hermes_api_key or "not-needed",
+        )
+        self._model = settings.hermes_model
+
+    def complete(self, messages: list[dict[str, str]], system: str) -> str:
+        chat_messages = [{"role": "system", "content": system}]
+        chat_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
+
+        kwargs: dict[str, Any] = {"model": self._model, "messages": chat_messages}
+        # Only offer tools during tool-selection turns - synthesis/summary
+        # turns are plain text completions, same as the OpenAI/Anthropic
+        # backends.
+        if "MODE=TOOL_SELECTION" in system:
+            kwargs["tools"] = self._TOOLS
+            kwargs["tool_choice"] = "auto"
+
+        response = self._client.chat.completions.create(**kwargs)
+        message = response.choices[0].message
+
+        tool_calls = self._normalize_tool_calls(message)
+        if tool_calls:
+            # Re-encode into the same `{"tool_calls": [...]}` JSON-text
+            # convention every other provider's `complete()` produces, so
+            # the orchestrator's `_safe_json` parsing needs no changes.
+            return json.dumps({"tool_calls": tool_calls})
+
+        return (message.content or "").strip()
+
+    def _normalize_tool_calls(self, message: Any) -> list[dict[str, Any]]:
+        """Normalize either structured `tool_calls` or inline `<tool_call>`
+        tags into the `{"tool": ..., "args": {...}}` shape the orchestrator
+        expects (the same shape the mock provider emits directly as JSON).
+        """
+        calls: list[dict[str, Any]] = []
+
+        # 1. Standard OpenAI-style structured tool calls - most vLLM/Ollama/
+        # OpenRouter OpenAI-compatible servers with native function-calling
+        # support return this.
+        structured = getattr(message, "tool_calls", None) or []
+        for tc in structured:
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            name = getattr(fn, "name", None)
+            args = self._safe_load_args(getattr(fn, "arguments", None) or "{}")
+            if name:
+                calls.append({"tool": name, "args": args})
+
+        if calls:
+            return calls
+
+        # 2. Defensive fallback: some Hermes deployments/chat templates emit
+        # tool calls as inline text tags instead of the structured field.
+        content = getattr(message, "content", None) or ""
+        for match in self._TOOL_CALL_TAG_RE.finditer(content):
+            payload = self._safe_load_args(match.group(1))
+            name = payload.get("name")
+            if not name:
+                continue
+            args = payload.get("arguments", {})
+            if isinstance(args, str):
+                args = self._safe_load_args(args)
+            calls.append({"tool": name, "args": args})
+
+        return calls
+
+    @staticmethod
+    def _safe_load_args(raw: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+
 def get_llm_client() -> LLMClient:
     """Factory that returns the configured LLM backend.
 
@@ -380,6 +578,11 @@ def get_llm_client() -> LLMClient:
     if provider == "openai":
         try:
             return OpenAILLMClient()
+        except Exception:
+            return MockLLMClient()
+    if provider == "hermes":
+        try:
+            return HermesLLMClient()
         except Exception:
             return MockLLMClient()
     return MockLLMClient()

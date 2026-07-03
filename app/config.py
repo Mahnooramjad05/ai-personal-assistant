@@ -32,6 +32,16 @@ class Settings:
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+    # Hermes (NousResearch) models are served over an OpenAI-compatible
+    # chat-completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, ...),
+    # so this reuses the `openai` SDK pointed at a custom base_url rather
+    # than a dedicated Hermes SDK.
+    hermes_base_url: str | None = os.getenv("HERMES_BASE_URL")
+    hermes_model: str = os.getenv("HERMES_MODEL", "")
+    # Many local servers (e.g. Ollama) don't require a real key, but the
+    # openai SDK requires a non-empty string - default to a placeholder.
+    hermes_api_key: str | None = os.getenv("HERMES_API_KEY")
+
     # Number of user/assistant turn-pairs kept verbatim before the older
     # portion of the conversation is summarized/compacted.
     max_turns_before_summary: int = _get_int("MAX_TURNS_BEFORE_SUMMARY", 8)
