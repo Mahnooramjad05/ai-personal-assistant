@@ -6,7 +6,7 @@ An LLM-powered agent that maintains conversational context across turns and auto
 
 This project is a working, runnable implementation of an agentic personal assistant, not a slide-deck sketch. A user sends a chat message; the assistant decides which tool(s) to call (possibly several, in sequence, for multi-step requests like "add a task to call the dentist and remind me tomorrow at 9am"); it actually executes those tools against a local SQLite database; and it synthesizes a natural-language reply that reflects what really happened. Conversation history is kept per-session and automatically summarized once it grows past a configurable length, so long-running sessions never blow past the model's context window.
 
-The LLM backend is pluggable: it runs against Anthropic's Claude API or OpenAI's API if a key is configured, and falls back to a deterministic, fully offline mock implementation otherwise - so the whole system (orchestration, tool calling, summarization) is exercisable and testable with zero network access and no paid API key.
+The LLM backend is pluggable: it runs against Anthropic's Claude API, OpenAI's API, or a self-hosted NousResearch Hermes model behind an OpenAI-compatible endpoint (Ollama, vLLM, LM Studio, OpenRouter) if configured, and falls back to a deterministic, fully offline mock implementation otherwise - so the whole system (orchestration, tool calling, summarization) is exercisable and testable with zero network access and no paid API key.
 
 ## Key Features
 
@@ -18,8 +18,8 @@ The LLM backend is pluggable: it runs against Anthropic's Claude API or OpenAI's
 - **LangGraph-based orchestration loop** (`app/orchestrator.py`) using a real `StateGraph`, not a hand-rolled if/else chain: tool selection -> tool execution -> response synthesis, with support for chaining multiple tool calls from a single user message.
 - **FastAPI backend** exposing `POST /chat` plus direct verification endpoints (`/sessions/{id}/tasks`, `/sessions/{id}/reminders`, `/sessions/{id}/history`, `/sessions/{id}/summary`) so tool effects can be checked independently of the chat flow.
 - **Streamlit chat UI** (`streamlit_app.py`) that talks to the FastAPI backend when it's running, and transparently falls back to calling the assistant module in-process otherwise.
-- **Pluggable LLM provider** - Anthropic, OpenAI, or an offline deterministic mock, selected via `LLM_PROVIDER`.
-- **pytest suite** (28 tests) covering the store, reminder date-range queries, multi-step tool orchestration, conversation summarization, retrieval, and the backend API - all running against the mock LLM and a temporary SQLite file, with no live network calls.
+- **Pluggable LLM provider** - Anthropic, OpenAI, a self-hosted Hermes model (OpenAI-compatible endpoint), or an offline deterministic mock, selected via `LLM_PROVIDER`.
+- **pytest suite** (35 tests) covering the store, reminder date-range queries, multi-step tool orchestration, conversation summarization, retrieval, the backend API, and Hermes provider selection/tool-call normalization - all running against the mock LLM (or stubbed Hermes responses) and a temporary SQLite file, with no live network calls.
 
 ## Tech Stack
 
@@ -28,7 +28,7 @@ The LLM backend is pluggable: it runs against Anthropic's Claude API or OpenAI's
 - FastAPI + Uvicorn for the backend REST API
 - Streamlit for the chat UI
 - SQLite (via the standard library `sqlite3`) for tasks, reminders, and conversation history
-- Anthropic SDK / OpenAI SDK (optional, pluggable) for the real LLM backends
+- Anthropic SDK / OpenAI SDK (optional, pluggable) for the real LLM backends - the Hermes provider also reuses the `openai` SDK, pointed at a custom `base_url`, rather than adding a new HTTP dependency
 - pydantic for request/response models
 - python-dotenv for environment configuration
 - pytest for the test suite
@@ -66,6 +66,16 @@ A conditional edge lets the graph loop back for another round of tool selection 
 
 `streamlit_app.py` is a real chat client: it POSTs to the backend's `/chat` endpoint and renders the reply plus an expandable "tool calls made" panel, and displays live task/reminder lists in the sidebar (pulled from the verification endpoints). If the backend isn't running, it detects that (`GET /health` unreachable) and falls back to instantiating `Assistant` in-process directly, so `streamlit run streamlit_app.py` works completely standalone as well.
 
+### LLM providers, and how each was validated
+
+`app/llm_client.py` defines one class per backend, all implementing the same `complete(messages, system) -> str` interface (plus a shared `summarize()` built on top of it), so `app/orchestrator.py` never needs to know which one is active:
+
+- **`MockLLMClient`** - deterministic, offline, pattern-matching tool selection and extractive summarization. This is the primary path exercised by the whole test suite.
+- **`AnthropicLLMClient`** / **`OpenAILLMClient`** - real backends via the official `anthropic` / `openai` SDKs. Tool selection for these relies on prompt-based JSON (the model is asked, in the system prompt, to reply with `{"tool_calls": [...]}`), not the provider's native structured function-calling API.
+- **`HermesLLMClient`** - targets a self-hosted NousResearch Hermes model behind an **OpenAI-compatible chat-completions endpoint** (Ollama, vLLM, LM Studio, or OpenRouter - any of these work, since they all speak the same wire format). It reuses the official `openai` SDK configured with a custom `base_url` rather than adding a new HTTP dependency, and reads `HERMES_BASE_URL` (the endpoint), `HERMES_MODEL` (the model name to request), and an optional `HERMES_API_KEY` (many local servers such as Ollama don't check it at all; the client defaults to a `"not-needed"` placeholder since the `openai` SDK requires a non-empty string). Unlike the Anthropic/OpenAI providers, Hermes additionally sends the tool catalogue via the real OpenAI-compatible `tools` request parameter during tool-selection turns, then normalizes whatever comes back into the same `{"tool_calls": [...]}` JSON-text shape the orchestrator already expects: it first looks for the standard structured `tool_calls` field (what most vLLM/Ollama/OpenRouter OpenAI-compatible servers with native function-calling return), and if that's empty but the message content contains a `<tool_call>{"name": ..., "arguments": ...}</tool_call>`-style tag (how some Hermes chat templates emit calls when the server doesn't support structured function calling), it parses that instead. Either way, the orchestrator's control flow in `app/orchestrator.py` is untouched - all the normalization lives inside `HermesLLMClient`.
+  - **Validation status:** the Hermes provider was validated in this repo against stubbed `openai` client responses (`tests/test_llm_client.py`) covering provider construction/config, the structured `tool_calls` path, and the `<tool_call>` tag fallback - not against a live paid or hosted Hermes endpoint. There is no Ollama/vLLM/LM Studio/OpenRouter server running in this environment; wiring it up to a real one is a matter of setting `HERMES_BASE_URL`/`HERMES_MODEL` and, same as Anthropic/OpenAI, is not covered by network-dependent tests (the suite never makes live calls to any of the three real providers).
+- All three real providers degrade gracefully: `get_llm_client()` falls back to `MockLLMClient` if the selected provider raises during construction (e.g. a missing base URL or API key), so the app never hard-crashes just because a key/endpoint is missing.
+
 ### Retrieval approach: local knowledge base, and why
 
 The brief allows either a real web search API or a local retrieval store, with the choice documented. In this environment, the free, no-key DuckDuckGo Instant Answer API returned HTTP 202 (accepted/throttled, not a reliable 200) on repeated test requests rather than consistent, testable responses - not something a graded, offline-runnable test suite should depend on. This project therefore implements genuine local retrieval instead: `app/knowledge/*.txt` holds five short general-knowledge snippets (Python, the Solar System, World War II, the human body, economics basics). `app/tools/retrieval.py` builds a TF-IDF index from scratch (sentence-level chunking, term frequency x inverse document frequency, cosine similarity - no external embedding API, no hardcoded query->answer map) and returns the best-matching chunk plus its source file and similarity score. `tests/test_retrieval.py` verifies that different queries surface different, topically-correct sources, confirming this is real retrieval and not a lookup table. Swapping in a live web-search tool later is a drop-in change: `search_knowledge_base(query) -> RetrievalResult` is the only interface the orchestrator depends on.
@@ -85,8 +95,10 @@ pip install -r requirements.txt
 
 # 4. Configure environment variables (optional - runs fine with defaults)
 cp .env.example .env
-# Edit .env if you want to use a real Anthropic or OpenAI key; otherwise
-# leave LLM_PROVIDER=mock for fully offline operation.
+# Edit .env if you want to use a real Anthropic key, OpenAI key, or a
+# self-hosted Hermes model behind an OpenAI-compatible endpoint (Ollama,
+# vLLM, LM Studio, OpenRouter); otherwise leave LLM_PROVIDER=mock for fully
+# offline operation.
 ```
 
 ### Running with Docker
@@ -164,17 +176,20 @@ pytest
 pytest -v
 ```
 
-The suite (28 tests) covers: task creation/listing/completion round-trips against SQLite, reminder due-date range queries returning the correct subset, multi-step requests triggering the correct ordered tool calls (via the mock LLM path), conversation summarization actually triggering and shortening stored history once the turn limit is exceeded, retrieval returning genuinely different results for different queries, and the FastAPI endpoints end-to-end. No test requires a real API key or makes a live network call - `LLM_PROVIDER` is forced to `mock` in `tests/conftest.py`.
+The suite (35 tests) covers: task creation/listing/completion round-trips against SQLite, reminder due-date range queries returning the correct subset, multi-step requests triggering the correct ordered tool calls (via the mock LLM path), conversation summarization actually triggering and shortening stored history once the turn limit is exceeded, retrieval returning genuinely different results for different queries, the FastAPI endpoints end-to-end, and Hermes provider selection plus tool-call normalization (structured `tool_calls` and the `<tool_call>` tag fallback) against a stubbed `openai` client. No test requires a real API key, a running Hermes/Ollama/vLLM server, or makes a live network call - `LLM_PROVIDER` is forced to `mock` in `tests/conftest.py`, and the Hermes-specific tests stub `chat.completions.create` directly.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `mock` | `"mock"` (offline/deterministic), `"anthropic"`, or `"openai"` |
+| `LLM_PROVIDER` | `mock` | `"mock"` (offline/deterministic), `"anthropic"`, `"openai"`, or `"hermes"` |
 | `ANTHROPIC_API_KEY` | unset | Required only when `LLM_PROVIDER=anthropic` |
 | `ANTHROPIC_MODEL` | `claude-opus-4-8` | Anthropic model id |
 | `OPENAI_API_KEY` | unset | Required only when `LLM_PROVIDER=openai` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model id |
+| `HERMES_BASE_URL` | unset | Required only when `LLM_PROVIDER=hermes`. URL of an OpenAI-compatible chat-completions endpoint serving a Hermes model (Ollama, vLLM, LM Studio, or OpenRouter), e.g. `http://localhost:11434/v1` for Ollama |
+| `HERMES_MODEL` | unset | Required only when `LLM_PROVIDER=hermes`. Model name to request from the endpoint above |
+| `HERMES_API_KEY` | unset | Optional even when `LLM_PROVIDER=hermes` - many local servers (e.g. Ollama) don't check it; defaults to a `"not-needed"` placeholder string if left unset |
 | `MAX_TURNS_BEFORE_SUMMARY` | `8` | Turn-pairs kept verbatim before older history is summarized/compacted |
 | `DATABASE_PATH` | `assistant.db` | SQLite file path (created automatically at runtime, not checked in) |
 | `BACKEND_HOST` | `127.0.0.1` | Host the FastAPI backend binds to |
